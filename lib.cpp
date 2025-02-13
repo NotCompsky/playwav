@@ -24,7 +24,6 @@ const AVCodec* codec = nullptr;
 AVPacket packet;
 AVFrame* frame = nullptr;
 SwrContext* swrCtx = nullptr;
-AVAudioFifo* audioFifo[2];
 
 struct FormatCtx {
 	AVFormatContext* val;
@@ -65,15 +64,6 @@ bool initFFMPEG(){
 	}
 	swrCtx = swr_alloc();
 	
-	audioFifo[0] = av_audio_fifo_alloc(AV_SAMPLE_FMT_S16, 1, 1);
-	audioFifo[1] = av_audio_fifo_alloc(AV_SAMPLE_FMT_S16, 2, 1);
-	if (!audioFifo[0]){
-		return true;
-	}
-	if (!audioFifo[1]){
-		return true;
-	}
-	
 	frame = av_frame_alloc();
 	if (!frame){
 		return true;
@@ -89,8 +79,6 @@ void uninitFFMPEG(){
 	avcodec_free_context(&codecCtx);
 	swr_free(&swrCtx);
 	av_frame_free(&frame);
-	av_audio_fifo_free(audioFifo[0]);
-	av_audio_fifo_free(audioFifo[1]);
 }
 
 bool init_pulseaudio(){
@@ -181,9 +169,11 @@ int openFile(const char* filePath,  AVFormatContext** formatCtx_ref){
 	return audioStreamIndex;
 }
 
-template<typename T>
+template<bool is_planar, typename T>
 void mainloop(AVAudioFifo* const audio_fifo,  pa_simple* const pulseAudioConnection,  AVFormatContext* const formatCtx_val,  const int audioStreamIndex,  const int64_t startFrame,  const int64_t endFrame,  int64_t currentFrame,  const float user_volume_scale_ratio){
 	int pa_simple_write__prev_error = 0;
+	void* interleaved_data_buf = malloc(0);
+	unsigned interleaved_data_buf_sz = 0;
 	while (av_read_frame(formatCtx_val, &packet) >= 0){
 		if (packet.stream_index == audioStreamIndex){
 			const int rc1 = avcodec_send_packet(codecCtx, &packet);
@@ -204,34 +194,45 @@ void mainloop(AVAudioFifo* const audio_fifo,  pa_simple* const pulseAudioConnect
 				}
 			} else {
 				[[likely]]
-			
-				if (unlikely(frame->nb_samples == 0))
+				
+				const unsigned n_channels = frame->ch_layout.nb_channels; // previously ->channels
+				const int n_frame_samples = frame->nb_samples;
+				if (unlikely(n_frame_samples == 0))
 					continue;
-				/*const int convertedSamples = swr_convert(swrCtx, frame->data, frame->nb_samples, nullptr, 0);
-				if (unlikely(convertedSamples < 0)){
-					printf("Error converting input samples\n");
-					break;
-				}
-				if (convertedSamples == 0){
-					printf("swr_convert == 0\n");
-					break;
-				}*/
-				av_audio_fifo_write(audio_fifo, (void**)frame->data, frame->nb_samples);
-				
-				//printf("swr_convert(swrCtx, frame->data, %u, nullptr, 0)\n", frame->nb_samples);
-				//printf("convertedSamples == %i\n%u == av_audio_fifo_size(audio_fifo) >=? frame->nb_samples == %u\n", convertedSamples, av_audio_fifo_size(audio_fifo), frame->nb_samples);
-				
-				while (av_audio_fifo_size(audio_fifo) >= frame->nb_samples){
-					av_audio_fifo_read(audio_fifo, (void**)frame->data, frame->nb_samples);
-					
-					for (int i = 0;  i < frame->nb_samples * frame->channels;  ++i){
-						T* sample = reinterpret_cast<T*>(frame->data[0] + i * sizeof(T));
-						*sample = static_cast<T>((*sample) * user_volume_scale_ratio);
+				if constexpr (is_planar){
+					if (interleaved_data_buf_sz < n_frame_samples){
+						[[unlikely]]
+						free(interleaved_data_buf);
+						interleaved_data_buf = malloc(n_channels*n_frame_samples * sizeof(T));
 					}
+				}
+				av_audio_fifo_write(audio_fifo, (void**)frame->data, n_frame_samples);
+				
+				while (av_audio_fifo_size(audio_fifo) >= n_frame_samples){
+					av_audio_fifo_read(audio_fifo, (void**)frame->data, n_frame_samples);
 					
 					if (currentFrame >= startFrame){
+						T* interleaved_data;
+						if constexpr (is_planar){
+							interleaved_data = reinterpret_cast<T*>(interleaved_data_buf);
+						} else {
+							interleaved_data = reinterpret_cast<T*>(frame->data[0]);
+						}
+						for (int i = 0;  i < n_frame_samples;  ++i){
+							for (int j = 0;  j < n_channels;  ++j){
+								const unsigned offset = i*n_channels;
+								T value;
+								if constexpr (is_planar){
+									value = reinterpret_cast<T*>(frame->data[j])[i];
+								} else {
+									value = reinterpret_cast<T*>(frame->data[0] + offset*sizeof(T))[j];
+								}
+								interleaved_data[offset+j] = value * user_volume_scale_ratio;
+							}
+						}
+						
 						int error = 0;
-						pa_simple_write(pulseAudioConnection, frame->data[0], frame->nb_samples * sizeof(T), &error);
+						pa_simple_write(pulseAudioConnection, interleaved_data, n_channels*n_frame_samples * sizeof(T), &error);
 						if (error){
 							if (error != pa_simple_write__prev_error){
 								if (pa_simple_write__prev_error != 0){
@@ -243,7 +244,7 @@ void mainloop(AVAudioFifo* const audio_fifo,  pa_simple* const pulseAudioConnect
 							break;
 						}
 					}
-					currentFrame += frame->nb_samples;
+					currentFrame += n_frame_samples;
 					if (currentFrame >= endFrame)
 						break;
 				}
@@ -252,6 +253,9 @@ void mainloop(AVAudioFifo* const audio_fifo,  pa_simple* const pulseAudioConnect
 			}
 		}
 		av_packet_unref(&packet);
+	}
+	if constexpr (is_planar){
+		free(interleaved_data_buf);
 	}
 }
 
@@ -272,10 +276,25 @@ void playAudio(const char* const filePath,  const float startTime,  const float 
 	if (endTime == 0.0)
 		endFrame = UINT_MAX;
 	
+	const AVSampleFormat fmt = static_cast<AVSampleFormat>(formatCtx.val->streams[audioStreamIndex]->codecpar->format);
+	const unsigned n_channels = codecCtx->ch_layout.nb_channels;
+	
 	pa_sample_spec sampleSpec;
-	sampleSpec.format = PA_SAMPLE_S16LE;
 	sampleSpec.rate = codecCtx->sample_rate;
-	sampleSpec.channels = codecCtx->channels;
+	sampleSpec.channels = n_channels;
+	switch(fmt){
+		case AV_SAMPLE_FMT_FLT:
+		case AV_SAMPLE_FMT_FLTP:
+			sampleSpec.format = PA_SAMPLE_FLOAT32LE;
+			break;
+		case AV_SAMPLE_FMT_S16:
+		case AV_SAMPLE_FMT_S16P:
+			sampleSpec.format = PA_SAMPLE_S16LE;
+			break;
+		default:
+			printf("Not implemented this format yet for sampleSpec.format = <stuff>\n");
+			return;
+	}
 	int pacerrorintval;
 	const PulseAudioConnection pulseAudioConnection(&sampleSpec, &pacerrorintval);
 	
@@ -284,24 +303,49 @@ void playAudio(const char* const filePath,  const float startTime,  const float 
 		return;
 	}
 	
-	switch(formatCtx.val->streams[audioStreamIndex]->codecpar->format){
+	AVAudioFifo* const audio_fifo = av_audio_fifo_alloc(fmt, n_channels, 1);
+	if (!audio_fifo){
+		[[unlikely]]
+		printf("Failed to allocate audio FIFO\n");
+		return;
+	}
+	switch(fmt){
 		case AV_SAMPLE_FMT_FLT:
-			mainloop<float>(audioFifo[codecCtx->channels-1], pulseAudioConnection.val, formatCtx.val, audioStreamIndex, startFrame, endFrame, currentFrame, user_volume_scale_ratio);
+			mainloop<false, float>(audio_fifo, pulseAudioConnection.val, formatCtx.val, audioStreamIndex, startFrame, endFrame, currentFrame, user_volume_scale_ratio);
 			break;
 		case AV_SAMPLE_FMT_DBL:
-			mainloop<double>(audioFifo[codecCtx->channels-1], pulseAudioConnection.val, formatCtx.val, audioStreamIndex, startFrame, endFrame, currentFrame, user_volume_scale_ratio);
+			mainloop<false, double>(audio_fifo, pulseAudioConnection.val, formatCtx.val, audioStreamIndex, startFrame, endFrame, currentFrame, user_volume_scale_ratio);
 			break;
 		case AV_SAMPLE_FMT_U8:
-			mainloop<uint8_t>(audioFifo[codecCtx->channels-1], pulseAudioConnection.val, formatCtx.val, audioStreamIndex, startFrame, endFrame, currentFrame, user_volume_scale_ratio);
+			mainloop<false, uint8_t>(audio_fifo, pulseAudioConnection.val, formatCtx.val, audioStreamIndex, startFrame, endFrame, currentFrame, user_volume_scale_ratio);
 			break;
 		case AV_SAMPLE_FMT_S16:
-			mainloop<int16_t>(audioFifo[codecCtx->channels-1], pulseAudioConnection.val, formatCtx.val, audioStreamIndex, startFrame, endFrame, currentFrame, user_volume_scale_ratio);
+			mainloop<false, int16_t>(audio_fifo, pulseAudioConnection.val, formatCtx.val, audioStreamIndex, startFrame, endFrame, currentFrame, user_volume_scale_ratio);
 			break;
 		case AV_SAMPLE_FMT_S32:
-			mainloop<int32_t>(audioFifo[codecCtx->channels-1], pulseAudioConnection.val, formatCtx.val, audioStreamIndex, startFrame, endFrame, currentFrame, user_volume_scale_ratio);
+			mainloop<false, int32_t>(audio_fifo, pulseAudioConnection.val, formatCtx.val, audioStreamIndex, startFrame, endFrame, currentFrame, user_volume_scale_ratio);
 			break;
 		case AV_SAMPLE_FMT_S64:
-			mainloop<int64_t>(audioFifo[codecCtx->channels-1], pulseAudioConnection.val, formatCtx.val, audioStreamIndex, startFrame, endFrame, currentFrame, user_volume_scale_ratio);
+			mainloop<false, int64_t>(audio_fifo, pulseAudioConnection.val, formatCtx.val, audioStreamIndex, startFrame, endFrame, currentFrame, user_volume_scale_ratio);
+			break;
+		
+		case AV_SAMPLE_FMT_FLTP:
+			mainloop<true,  float>(audio_fifo, pulseAudioConnection.val, formatCtx.val, audioStreamIndex, startFrame, endFrame, currentFrame, user_volume_scale_ratio);
+			break;
+		case AV_SAMPLE_FMT_DBLP:
+			mainloop<true,  double>(audio_fifo, pulseAudioConnection.val, formatCtx.val, audioStreamIndex, startFrame, endFrame, currentFrame, user_volume_scale_ratio);
+			break;
+		case AV_SAMPLE_FMT_U8P:
+			mainloop<true,  uint8_t>(audio_fifo, pulseAudioConnection.val, formatCtx.val, audioStreamIndex, startFrame, endFrame, currentFrame, user_volume_scale_ratio);
+			break;
+		case AV_SAMPLE_FMT_S16P:
+			mainloop<true,  int16_t>(audio_fifo, pulseAudioConnection.val, formatCtx.val, audioStreamIndex, startFrame, endFrame, currentFrame, user_volume_scale_ratio);
+			break;
+		case AV_SAMPLE_FMT_S32P:
+			mainloop<true,  int32_t>(audio_fifo, pulseAudioConnection.val, formatCtx.val, audioStreamIndex, startFrame, endFrame, currentFrame, user_volume_scale_ratio);
+			break;
+		case AV_SAMPLE_FMT_S64P:
+			mainloop<true,  int64_t>(audio_fifo, pulseAudioConnection.val, formatCtx.val, audioStreamIndex, startFrame, endFrame, currentFrame, user_volume_scale_ratio);
 			break;
 		/*
 		AV_SAMPLE_FMT_U8P,         ///< unsigned 8 bits, planar
@@ -312,7 +356,8 @@ void playAudio(const char* const filePath,  const float startTime,  const float 
 		AV_SAMPLE_FMT_S64P
 		*/
 		default:
-			printf("Unrecognised format: %u\n", formatCtx.val->streams[audioStreamIndex]->codecpar->format);
+			printf("Unrecognised format: %u\n", fmt);
 			return;
 	}
+	av_audio_fifo_free(audio_fifo);
 }
