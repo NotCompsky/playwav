@@ -72,6 +72,7 @@ bool initFFMPEG(){
 	
 	frame = av_frame_alloc();
 	if (!frame){
+		[[unlikely]]
 		return true;
 	}
 	
