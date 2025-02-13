@@ -5,14 +5,16 @@
 #include <unistd.h>
 
 
-extern "C"
-int init_all();
+struct GlobalVars;
 
 extern "C"
-int uninit_all();
+GlobalVars* initFFMPEG();
 
 extern "C"
-void playAudio(const char* const filePath,  float,  float,  float);
+void uninitFFMPEG(GlobalVars* const globalvars);
+
+extern "C"
+void playAudio(GlobalVars* const globalvars,  const char* const filePath,  float,  float,  float);
 
 
 int main(const int argc,  const char* const* const argv){
@@ -20,7 +22,8 @@ int main(const int argc,  const char* const* const argv){
 		write(1, "USAGE: [-l, to loop everything] [-r REPEATS=1, to repeat the next audio] [-v VOLUME=1.0] [[FILEPATHS]]\n", 103);
 		return 0;
 	}
-	if (unlikely(init_all()))
+	GlobalVars* const globalvars = initFFMPEG();
+	if (unlikely(globalvars == nullptr))
 		return 1;
 	bool loop = false;
 	float volume = 1.0;
@@ -50,11 +53,11 @@ int main(const int argc,  const char* const* const argv){
 				}
 			}
 			do {
-				playAudio(argv[i], 0.0, 0.0, volume);
+				playAudio(globalvars, argv[i], 0.0, 0.0, volume);
 			} while(--n_repeats != 0);
 			++n_repeats;
 		}
 	} while(loop);
-	uninit_all();
+	uninitFFMPEG(globalvars);
 	return 0;
 }
