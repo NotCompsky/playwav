@@ -25,6 +25,12 @@ AVPacket packet;
 AVFrame* frame = nullptr;
 SwrContext* swrCtx = nullptr;
 
+AVAudioFifo* audio_fifo;
+AVSampleFormat audio_fifo_fmt = AV_SAMPLE_FMT_NONE;
+
+void* interleaved_data_buf;
+unsigned interleaved_data_buf_sz = 0;
+
 struct FormatCtx {
 	AVFormatContext* val;
 	FormatCtx()
@@ -95,12 +101,21 @@ int init_all(){
 	bool failed = false;
 	failed |= initFFMPEG();
 	failed |= init_pulseaudio();
+	
+	interleaved_data_buf = malloc(0);
+	
 	return failed;
 }
 extern "C"
 int uninit_all(){
 	uninit_pulseaudio();
 	uninitFFMPEG();
+	
+	if (audio_fifo_fmt != AV_SAMPLE_FMT_NONE)
+		av_audio_fifo_free(audio_fifo);
+	if (interleaved_data_buf_sz != 0)
+		free(interleaved_data_buf);
+	
 	return 0;
 }
 
@@ -172,8 +187,6 @@ int openFile(const char* filePath,  AVFormatContext** formatCtx_ref){
 template<bool is_planar, typename T>
 void mainloop(AVAudioFifo* const audio_fifo,  pa_simple* const pulseAudioConnection,  AVFormatContext* const formatCtx_val,  const int audioStreamIndex,  const int64_t startFrame,  const int64_t endFrame,  int64_t currentFrame,  const float user_volume_scale_ratio){
 	int pa_simple_write__prev_error = 0;
-	void* interleaved_data_buf = malloc(0);
-	unsigned interleaved_data_buf_sz = 0;
 	while (av_read_frame(formatCtx_val, &packet) >= 0){
 		if (packet.stream_index == audioStreamIndex){
 			const int rc1 = avcodec_send_packet(codecCtx, &packet);
@@ -199,11 +212,13 @@ void mainloop(AVAudioFifo* const audio_fifo,  pa_simple* const pulseAudioConnect
 				const int n_frame_samples = frame->nb_samples;
 				if (unlikely(n_frame_samples == 0))
 					continue;
+				const size_t data_buf_sz = n_channels*n_frame_samples * sizeof(T);
 				if constexpr (is_planar){
-					if (interleaved_data_buf_sz < n_frame_samples){
+					if (interleaved_data_buf_sz < data_buf_sz){
 						[[unlikely]]
 						free(interleaved_data_buf);
-						interleaved_data_buf = malloc(n_channels*n_frame_samples * sizeof(T));
+						interleaved_data_buf = malloc(data_buf_sz);
+						interleaved_data_buf_sz = data_buf_sz;
 					}
 				}
 				av_audio_fifo_write(audio_fifo, (void**)frame->data, n_frame_samples);
@@ -232,7 +247,7 @@ void mainloop(AVAudioFifo* const audio_fifo,  pa_simple* const pulseAudioConnect
 						}
 						
 						int error = 0;
-						pa_simple_write(pulseAudioConnection, interleaved_data, n_channels*n_frame_samples * sizeof(T), &error);
+						pa_simple_write(pulseAudioConnection, interleaved_data, data_buf_sz, &error);
 						if (error){
 							if (error != pa_simple_write__prev_error){
 								if (pa_simple_write__prev_error != 0){
@@ -253,9 +268,6 @@ void mainloop(AVAudioFifo* const audio_fifo,  pa_simple* const pulseAudioConnect
 			}
 		}
 		av_packet_unref(&packet);
-	}
-	if constexpr (is_planar){
-		free(interleaved_data_buf);
 	}
 }
 
@@ -303,7 +315,12 @@ void playAudio(const char* const filePath,  const float startTime,  const float 
 		return;
 	}
 	
-	AVAudioFifo* const audio_fifo = av_audio_fifo_alloc(fmt, n_channels, 1);
+	if (audio_fifo_fmt != fmt){
+		if (audio_fifo_fmt != AV_SAMPLE_FMT_NONE)
+			av_audio_fifo_free(audio_fifo);
+		audio_fifo = av_audio_fifo_alloc(fmt, n_channels, 1);
+		audio_fifo_fmt = fmt;
+	}
 	if (!audio_fifo){
 		[[unlikely]]
 		printf("Failed to allocate audio FIFO\n");
@@ -359,5 +376,4 @@ void playAudio(const char* const filePath,  const float startTime,  const float 
 			printf("Unrecognised format: %u\n", fmt);
 			return;
 	}
-	av_audio_fifo_free(audio_fifo);
 }
