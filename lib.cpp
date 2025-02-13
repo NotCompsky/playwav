@@ -20,7 +20,7 @@ extern "C" {
 }
 
 AVCodecContext* codecCtx = nullptr;
-AVCodec* codec = nullptr;
+const AVCodec* codec = nullptr;
 AVPacket packet;
 AVFrame* frame = nullptr;
 SwrContext* swrCtx = nullptr;
