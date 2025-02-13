@@ -161,8 +161,9 @@ int openFile(const char* filePath,  AVFormatContext** formatCtx_ref){
 		return -1;
 	}
 	
-	codecCtx->channel_layout = av_get_default_channel_layout(codecCtx->channels);
-		
+	const unsigned n_channels = codecCtx->ch_layout.nb_channels;
+	codecCtx->channel_layout = av_get_default_channel_layout(n_channels);
+	
 	av_opt_set_int(swrCtx, "in_channel_layout", codecCtx->channel_layout, 0);
 	av_opt_set_int(swrCtx, "out_channel_layout", codecCtx->channel_layout, 0);
 	av_opt_set_int(swrCtx, "in_sample_rate", codecCtx->sample_rate, 0);
@@ -175,8 +176,8 @@ int openFile(const char* filePath,  AVFormatContext** formatCtx_ref){
 		return -1;
 	}
 	
-	if ((codecCtx->channels != 1) and (codecCtx->channels != 2)){
-		printf("Too many channels: codecCtx->channels == %i\n", codecCtx->channels);
+	if ((n_channels != 1) and (n_channels != 2)){
+		printf("Too many channels: n_channels == %i\n", n_channels);
 		avformat_close_input(formatCtx_ref);
 		return -1;
 	}
